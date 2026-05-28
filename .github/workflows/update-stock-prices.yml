@@ -1,0 +1,39 @@
+name: Update stock prices
+
+# JST 平日 9:00-15:50 を15分間隔でカバー (UTC -9h)
+# UTC換算: 月-金 0:00-6:50 の15分毎
+on:
+  schedule:
+    - cron: "*/15 0-6 * * 1-5"
+  workflow_dispatch:        # GitHub UI から手動実行可能
+
+# 同時実行を抑止 (前のrunがYahooを叩いている最中に次のrunが重なるのを防ぐ)
+concurrency:
+  group: update-stock-prices
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install minimal deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install python-dotenv
+
+      - name: Run update_stock_prices.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python update_stock_prices.py

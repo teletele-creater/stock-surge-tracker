@@ -1,0 +1,32 @@
+# 環境変数・状態ファイル (絶対にpushしない)
+.env
+.state.json
+.state.json.bak
+.auth_state.json
+
+# 機密情報 (絶対にpushしない)
+APIキー.txt
+ntn_*.txt
+x_cookies_export.json
+
+# Python キャッシュ
+__pycache__/
+*.pyc
+
+# バックアップ・スクラッチ
+*.bak
+force_test_once.py
+image_demo.png
+
+# 個人メモ (公開不要)
+notes/*.md
+notes/*.html
+!notes/.gitkeep
+
+# 作業用ディレクトリ・アーカイブ
+_unzipped/
+filesweb.zip
+!doctype html.txt
+
+# Claude Code worktrees
+.claude/
