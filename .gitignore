@@ -13,6 +13,14 @@ x_cookies_export.json
 __pycache__/
 *.pyc
 
+# 自前急騰検知(kyutou) のランタイム生成物
+kyutou_cache/
+kyutou_logs/
+
+# 精度評価の生成物
+eval_results_*.csv
+eval_outputs/
+
 # バックアップ・スクラッチ
 *.bak
 force_test_once.py

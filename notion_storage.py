@@ -28,7 +28,10 @@ def save_to_notion(analysis: Analysis) -> str | None:
 
     client = Client(auth=NOTION_TOKEN)
     tweet = analysis.tweet
-    jst_datetime = tweet.created_at.strftime("%Y-%m-%dT%H:%M:%S+09:00")
+    # created_at は @shodousan経由=UTC / kyutou経由=JST。JSTに変換してから書き出す
+    # （変換せずに +09:00 を付けると9時間ズレる）
+    from storage import _to_jst
+    jst_datetime = _to_jst(tweet.created_at).strftime("%Y-%m-%dT%H:%M:%S+09:00")
 
     backgrounds_text = "\n".join(f"・{bg}" for bg in analysis.backgrounds) if analysis.backgrounds else ""
 

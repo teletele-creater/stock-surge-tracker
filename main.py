@@ -351,6 +351,9 @@ def run_watch(interval_min: int = 5, post: bool = False, slack: bool = False, au
         _resume_pending_posts(post=post, slack=slack, auto=auto, reason=reason)
 
     def _process_tweets(tweets, phase_label: str):
+        # クロスソースの当日重複防止: @shodousan / kyutou をまたいで同一銘柄は1日1回だけ
+        from storage import was_code_handled_today, mark_code_handled_today
+
         analyses = []
         if not tweets:
             print(f"[INFO] {phase_label}: no new stock-related tweets")
@@ -358,14 +361,31 @@ def run_watch(interval_min: int = 5, post: bool = False, slack: bool = False, au
 
         print(f"[INFO] {phase_label}: processing {len(tweets)} tweet(s)")
         for tweet in tweets:
+            primary = tweet.stock_codes[0] if tweet.stock_codes else None
+            # 分析前チェック（Claude呼び出しを節約）
+            if primary and was_code_handled_today(primary):
+                print(f"[SKIP] {phase_label}: {primary} は本日処理済み（重複）")
+                continue
             print(f"[INFO] {phase_label}: {tweet.text[:60]}...")
             try:
                 analysis = analyze_tweet(tweet)
-                path = save_analysis(analysis)
-                analyses.append(analysis)
-                print(f"[OK] {phase_label}: saved {path.name}")
             except Exception as e:
                 print(f"[ERROR] {phase_label}: {e}")
+                continue
+            # 分析後、確定した銘柄コードで再チェック
+            code = analysis.stock_code or primary
+            if code and was_code_handled_today(code):
+                print(f"[SKIP] {phase_label}: {code} は本日処理済み（重複）")
+                continue
+            try:
+                path = save_analysis(analysis)
+            except Exception as e:
+                print(f"[ERROR] {phase_label}: save failed: {e}")
+                continue
+            if code:
+                mark_code_handled_today(code)
+            analyses.append(analysis)
+            print(f"[OK] {phase_label}: saved {path.name}")
 
         if analyses:
             html_path = generate_html()
@@ -378,31 +398,55 @@ def run_watch(interval_min: int = 5, post: bool = False, slack: bool = False, au
     _resume_pending_posts(post=post, slack=slack, auto=auto, reason="startup")
     last_id = get_last_tweet_id()
 
-    if last_id:
-        print(f"\n[INFO] startup check: looking for tweets newer than {last_id}")
-        startup_tweets = fetch_tweets(since_id=last_id, max_count=20, today_only=False)
-        _process_tweets(startup_tweets, "startup")
-    else:
-        print("\n[INFO] startup check: no saved state, importing latest tweets")
-        startup_tweets = fetch_tweets(max_count=20, today_only=False)
-        _process_tweets(startup_tweets, "initial import")
+    # 起動時チェック（失敗してもループには入る）
+    try:
+        if last_id:
+            print(f"\n[INFO] startup check: looking for tweets newer than {last_id}")
+            startup_tweets = fetch_tweets(since_id=last_id, max_count=20, today_only=False)
+            _process_tweets(startup_tweets, "startup")
+        else:
+            print("\n[INFO] startup check: no saved state, importing latest tweets")
+            startup_tweets = fetch_tweets(max_count=20, today_only=False)
+            _process_tweets(startup_tweets, "initial import")
+    except Exception as e:
+        print(f"[ERROR] startup check failed (continuing to watch loop): {e}")
 
     last_id = get_last_tweet_id() or last_id
+
+    # 2ソースを1ティックごとに交互に拾う。startup が @shodousan のため
+    # ループ最初のティックは kyutou から始める（tick=1）。
+    sources = ["shodousan", "kyutou"]
+    tick = 1
 
     try:
         while True:
             next_check = datetime.now(jst) + timedelta(minutes=interval_min)
-            print(f"\n[WAIT] next check at {next_check.strftime('%H:%M')} JST ({interval_min} min)")
+            next_source = sources[tick % len(sources)]
+            print(f"\n[WAIT] next check at {next_check.strftime('%H:%M')} JST "
+                  f"({interval_min} min, source={next_source})")
             time.sleep(interval_min * 60)
 
+            source = sources[tick % len(sources)]
+            tick += 1
             now_str = datetime.now(jst).strftime("%H:%M")
-            print(f"\n[CHECK] [{now_str}] checking for new tweets...")
+            print(f"\n[CHECK] [{now_str}] source={source}")
 
-            current_last_id = get_last_tweet_id() or last_id
-            new_tweets = fetch_tweets(since_id=current_last_id, max_count=20, today_only=False)
-            analyses = _process_tweets(new_tweets, f"check {now_str}")
-            if analyses:
-                last_id = get_last_tweet_id() or last_id
+            # 1ティックの失敗（X側のDOM変更・ネットワーク断等）でループ全体を
+            # 殺さない。エラーを表示して次のティックに進む。
+            try:
+                if source == "shodousan":
+                    current_last_id = get_last_tweet_id() or last_id
+                    new_tweets = fetch_tweets(since_id=current_last_id, max_count=20, today_only=False)
+                    analyses = _process_tweets(new_tweets, f"shodousan {now_str}")
+                    if analyses:
+                        last_id = get_last_tweet_id() or last_id
+                else:
+                    from kyutou_source import fetch_new_surge_tweets
+                    surge_tweets = fetch_new_surge_tweets()
+                    _process_tweets(surge_tweets, f"kyutou {now_str}")
+            except Exception as e:
+                print(f"[ERROR] {source} {now_str}: tick failed, will retry next cycle: "
+                      f"{type(e).__name__}: {e}")
 
     except KeyboardInterrupt:
         print("\n\n[STOP] watch mode stopped")
@@ -453,6 +497,48 @@ def run_force_recent(count: int, post: bool = False, slack: bool = False, auto: 
         _resume_pending_posts(post=post, slack=slack, auto=auto, reason="force-recent")
     else:
         print(f"\n[INFO] 投稿フラグなし(--slack/--post/--auto-post)、分析・保存のみ")
+
+
+def run_kyutou_once(count: int = 1, post: bool = False, slack: bool = False,
+                    auto: bool = False, ignore_hours: bool = False):
+    """自前検知(kyutou)を1回走らせ、先頭N件を分析→保存→X投稿まで通す（テスト用）。
+
+    重複抑制はバイパスするので、同じ銘柄でも繰り返し試せる。
+    投稿フラグ(--post/--slack/--auto-post)が無い場合は分析・保存まで。
+    """
+    from kyutou_source import fetch_new_surge_tweets
+    from analyzer import analyze_tweets
+    from storage import save_analyses
+    from viewer import generate_html
+
+    print("=" * 50)
+    print(f"{get_japanese_greeting()} 急騰検知(kyutou)単発モード (先頭{count}件)")
+    print("=" * 50)
+
+    tweets = fetch_new_surge_tweets(
+        market_hours_only=not ignore_hours, limit=count, ignore_dedup=True,
+    )
+    if not tweets:
+        print("[INFO] 条件を満たす急騰銘柄がありませんでした")
+        return
+
+    print(f"\n[INFO] {len(tweets)} 件を分析します")
+    analyses = analyze_tweets(tweets)
+    if not analyses:
+        print("分析結果なし")
+        return
+
+    save_analyses(analyses)
+    html_path = generate_html()
+    print(f"\n[OK] {len(analyses)} 件保存")
+    print(f"[HTML] {html_path.absolute()}")
+
+    if slack or post or auto:
+        print(f"\n📤 投稿フロー ({len(analyses)} 件、kyutou単発)")
+        _queue_post_requests(analyses, force=True)
+        _resume_pending_posts(post=post, slack=slack, auto=auto, reason="kyutou-once")
+    else:
+        print("\n[INFO] 投稿フラグなし(--post/--slack/--auto-post)、分析・保存のみ")
 
 
 def run(fetch_all: bool = False, post: bool = False, slack: bool = False, auto: bool = False):
@@ -540,6 +626,10 @@ def main():
                         help="分析後に承認なしで自動的にXへ投稿 (画像付き)")
     parser.add_argument("--force-recent", dest="force_recent", type=int, metavar="N",
                         help="直近N件のツイートをposted_idsチェック無視で強制再処理 (例: --force-recent 10)")
+    parser.add_argument("--kyutou-once", dest="kyutou_once", type=int, nargs="?", const=1, metavar="N",
+                        help="自前検知(kyutou)を1回走らせ先頭N件を分析→投稿 (既定1件、重複抑制バイパス)")
+    parser.add_argument("--ignore-hours", dest="ignore_hours", action="store_true",
+                        help="市場時間外でもkyutou検知を実行する (--kyutou-once のテスト用)")
     args = parser.parse_args()
 
     if args.setup:
@@ -551,6 +641,9 @@ def main():
     elif args.force_recent is not None:
         run_force_recent(count=args.force_recent, post=args.post,
                          slack=args.slack, auto=args.auto_post)
+    elif args.kyutou_once is not None:
+        run_kyutou_once(count=args.kyutou_once, post=args.post, slack=args.slack,
+                        auto=args.auto_post, ignore_hours=args.ignore_hours)
     elif args.latest:
         run_latest(post=args.post, slack=args.slack, auto=args.auto_post)
     elif args.watch is not None:

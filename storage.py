@@ -4,13 +4,26 @@
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from analyzer import Analysis
 from config import NOTES_DIR
 
 
 STATE_FILE = Path(__file__).parent / ".state.json"
+
+JST = timezone(timedelta(hours=9))
+
+
+def _to_jst(dt: datetime) -> datetime:
+    """tweet.created_at をJSTに変換する。
+
+    @shodousan経由はUTC、kyutou経由はJSTで入ってくるため、表示・保存前に
+    必ずここを通して統一する。naive（tz情報なし）はUTCとみなす。
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(JST)
 
 
 def _default_state() -> dict:
@@ -20,6 +33,9 @@ def _default_state() -> dict:
         "last_posted_tweet_id": None,
         "posted_ids": [],
         "pending_posts": [],
+        # クロスソースの当日重複防止: {"YYYY-MM-DD": ["5367", ...]}
+        # @shodousan と自前検知(kyutou)の両方を通じて、同一銘柄は1日1回だけ処理する。
+        "daily_codes": {},
     }
 
 
@@ -33,8 +49,62 @@ def _load_state() -> dict:
         state["processed_ids"] = list(state.get("processed_ids") or [])
         state["posted_ids"] = list(state.get("posted_ids") or [])
         state["pending_posts"] = list(state.get("pending_posts") or [])
+        state["daily_codes"] = dict(state.get("daily_codes") or {})
         return state
     return _default_state()
+
+
+def _maybe_int(value) -> int | None:
+    """数値IDのみ int に変換する。自前検知の文字列ID(kyutou-...)は None を返す。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _today_jst() -> str:
+    return datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
+
+
+def _normalize_code(code: str) -> str:
+    """銘柄コードの表記ゆれ（テンプレート由来の括弧など）を正規化する。
+
+    Claude出力が「(5982)」のように括弧付きで返ることがあり、素の「5982」と
+    別物扱いになると当日重複防止が突破されるため、比較前に必ず剥がす。
+    """
+    t = (code or "").strip()
+    while len(t) >= 2 and t[0] in "(（" and t[-1] in ")）":
+        t = t[1:-1].strip()
+    return t
+
+
+def was_code_handled_today(code: str) -> bool:
+    """この銘柄コードが本日すでに処理（記録/投稿対象化）済みか。
+
+    @shodousan と自前検知(kyutou)をまたいだ重複防止に使う。
+    """
+    code = _normalize_code(code)
+    if not code:
+        return False
+    state = _load_state()
+    today_codes = state.get("daily_codes", {}).get(_today_jst(), [])
+    return code in {_normalize_code(c) for c in today_codes}
+
+
+def mark_code_handled_today(code: str) -> None:
+    """この銘柄コードを本日処理済みとして記録する（直近7日分のみ保持）。"""
+    code = _normalize_code(code)
+    if not code:
+        return
+    state = _load_state()
+    daily = state.setdefault("daily_codes", {})
+    codes = daily.setdefault(_today_jst(), [])
+    if code not in codes:
+        codes.append(code)
+    if len(daily) > 7:
+        for old_date in sorted(daily.keys())[:-7]:
+            daily.pop(old_date, None)
+    _save_state(state)
 
 
 def _save_state(state: dict) -> None:
@@ -121,9 +191,11 @@ def mark_posted(tweet_id: str) -> None:
     if tweet_id not in posted_ids:
         posted_ids.append(tweet_id)
 
-    last_posted = state.get("last_posted_tweet_id")
-    if not last_posted or int(tweet_id) > int(last_posted):
-        state["last_posted_tweet_id"] = tweet_id
+    tid = _maybe_int(tweet_id)
+    if tid is not None:
+        last_posted = _maybe_int(state.get("last_posted_tweet_id"))
+        if last_posted is None or tid > last_posted:
+            state["last_posted_tweet_id"] = tweet_id
 
     _save_state(state)
 
@@ -131,7 +203,7 @@ def mark_posted(tweet_id: str) -> None:
 def _format_markdown(analysis: Analysis) -> str:
     """Analysis を Markdown テキストに変換する"""
     tweet = analysis.tweet
-    jst_time = tweet.created_at.strftime("%Y-%m-%d %H:%M")
+    jst_time = _to_jst(tweet.created_at).strftime("%Y-%m-%d %H:%M")
 
     # 背景を箇条書きに
     backgrounds_md = "\n".join(f"・{bg}" for bg in analysis.backgrounds) if analysis.backgrounds else "・（情報不足）"
@@ -166,7 +238,7 @@ def _format_markdown(analysis: Analysis) -> str:
 
 ---
 
-*分析日時: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")} UTC*
+*分析日時: {datetime.now(JST).strftime("%Y-%m-%d %H:%M")} JST*
 """
 
 
@@ -183,7 +255,7 @@ def save_analysis(analysis: Analysis) -> Path:
         保存したファイルのパス
     """
     tweet = analysis.tweet
-    date_str = tweet.created_at.strftime("%Y%m%d_%H%M")
+    date_str = _to_jst(tweet.created_at).strftime("%Y%m%d_%H%M")
     code = analysis.stock_code.replace("/", "-")
     filename = f"{date_str}_{code}.md"
     filepath = NOTES_DIR / filename
@@ -204,8 +276,12 @@ def save_analysis(analysis: Analysis) -> Path:
 
     # 状態を更新
     state = _load_state()
-    if not state.get("last_tweet_id") or int(tweet.id) > int(state["last_tweet_id"]):
-        state["last_tweet_id"] = tweet.id
+    tid = _maybe_int(tweet.id)
+    if tid is not None:
+        # last_tweet_id は @shodousan の差分取得(since_id)用。数値IDのみ更新する。
+        current = _maybe_int(state.get("last_tweet_id"))
+        if current is None or tid > current:
+            state["last_tweet_id"] = tweet.id
     if tweet.id not in state.get("processed_ids", []):
         state.setdefault("processed_ids", []).append(tweet.id)
     _save_state(state)
@@ -233,7 +309,7 @@ def update_index() -> None:
 
     lines = [
         "# 株価上昇理由メモ (@shodousan)\n",
-        f"*最終更新: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC*\n",
+        f"*最終更新: {datetime.now(JST).strftime('%Y-%m-%d %H:%M')} JST*\n",
         "",
         "---",
         "",

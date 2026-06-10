@@ -6,6 +6,7 @@ Claude API アナライザー
 import anthropic
 import time
 from dataclasses import dataclass
+from datetime import timezone, timedelta
 from fetcher import Tweet
 from config import ANTHROPIC_API_KEY
 
@@ -69,7 +70,7 @@ def _is_retryable_anthropic_error(exc: Exception) -> bool:
     return "overloaded" in str(exc).lower()
 
 
-def _stream_analysis_with_retry(client: anthropic.Anthropic, tweet: Tweet, max_attempts: int = 4):
+def _stream_analysis_with_retry(client: anthropic.Anthropic, user_prompt: str, max_attempts: int = 4):
     last_error = None
 
     for attempt in range(1, max_attempts + 1):
@@ -79,7 +80,7 @@ def _stream_analysis_with_retry(client: anthropic.Anthropic, tweet: Tweet, max_a
                 max_tokens=2048,
                 system=SYSTEM_PROMPT,
                 messages=[
-                    {"role": "user", "content": _build_analysis_prompt(tweet)}
+                    {"role": "user", "content": user_prompt}
                 ]
             ) as stream:
                 return stream.get_final_message()
@@ -98,8 +99,37 @@ def _stream_analysis_with_retry(client: anthropic.Anthropic, tweet: Tweet, max_a
     raise last_error
 
 
-def _build_analysis_prompt(tweet: Tweet) -> str:
+def _build_materials_section(materials: dict | None) -> str:
+    """当日の一次情報（TDnet開示・ニュース見出し）をプロンプト追記用に整形する。
+
+    materials が None（取得失敗・未取得）の場合は空文字を返し、
+    プロンプトは従来と完全に同一になる（グラウンディングなしで続行）。
+    """
+    if not materials:
+        return ""
+    tdnet = materials.get("tdnet") or []
+    news = materials.get("news") or []
+    if not tdnet and not news:
+        return ""
+
+    tdnet_block = "\n".join(f"・{t}" for t in tdnet) if tdnet else "（該当なし）"
+    news_block = "\n".join(f"・{t}" for t in news) if news else "（該当なし）"
+    return f"""
+
+【参考: 当日の一次情報（前営業日15時以降〜当日）】
+■ TDnet適時開示:
+{tdnet_block}
+■ ニュース見出し（株探）:
+{news_block}
+
+上記に急騰の材料となる開示・報道があれば、それを(理由1)として最優先で採用すること。
+複数ある場合は株価インパクトが最も大きいものを選ぶこと。
+「ストップ高」「動意株」など結果を伝えるだけの見出しは理由にしないこと。"""
+
+
+def _build_analysis_prompt(tweet: Tweet, materials: dict | None = None) -> str:
     codes_str = "、".join(tweet.stock_codes) if tweet.stock_codes else "不明"
+    materials_section = _build_materials_section(materials)
     return f"""以下のポストを分析し、株価上昇理由をテンプレートに沿って出力してください。
 
 【ポスト内容】
@@ -129,7 +159,21 @@ def _build_analysis_prompt(tweet: Tweet) -> str:
 5. (キーワード)はテーマや業界トレンド（例: AI需要、インバウンド、防衛費増額）
 6. 関連銘柄は同様の恩恵が期待できる具体的な銘柄を2〜4社記載
 7. ポストだけでは情報が不足している場合、一般的な知識を補って分析する
-8. テンプレート以外のテキスト（注記・免責・補足説明など）は一切出力しない"""
+8. テンプレート以外のテキスト（注記・免責・補足説明など）は一切出力しない"""\
+        + materials_section
+
+
+def _strip_code_parens(text: str) -> str:
+    """テンプレート由来の括弧（半角・全角）を剥がす。
+
+    Claudeが「銘柄: (5982) (マルゼン)」のように括弧ごと返すことがあり、
+    そのままだと重複防止・Notion・Supabase・ファイル名すべてに波及するため、
+    パース時点で正規化する。
+    """
+    t = (text or "").strip()
+    while len(t) >= 2 and t[0] in "(（" and t[-1] in ")）":
+        t = t[1:-1].strip()
+    return t
 
 
 def _parse_output(text: str, tweet: Tweet) -> Analysis:
@@ -177,8 +221,8 @@ def _parse_output(text: str, tweet: Tweet) -> Analysis:
 
     return Analysis(
         tweet=tweet,
-        stock_code=stock_code,
-        stock_name=stock_name,
+        stock_code=_strip_code_parens(stock_code),
+        stock_name=_strip_code_parens(stock_name),
         reason=reason,
         business=business,
         keywords=keywords,
@@ -206,9 +250,24 @@ def analyze_tweet(tweet: Tweet) -> Analysis:
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+    # 当日の一次情報（TDnet開示・株探ニュース見出し）を取得して根拠付け。
+    # 取得失敗しても従来どおり材料なしで分析を続行する。
+    materials = None
+    if tweet.stock_codes:
+        try:
+            from materials import fetch_materials
+            day_str = tweet.created_at.astimezone(
+                timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
+            materials = fetch_materials(tweet.stock_codes[0], day_str)
+            print(f"  [材料] TDnet開示 {len(materials['tdnet'])}件 / "
+                  f"ニュース見出し {len(materials['news'])}件")
+        except Exception as e:
+            print(f"  [WARN] 材料取得失敗（材料なしで分析続行）: {e}")
+            materials = None
+
     print(f"  [Claude] 分析中: {tweet.text[:50]}...")
 
-    response = _stream_analysis_with_retry(client, tweet)
+    response = _stream_analysis_with_retry(client, _build_analysis_prompt(tweet, materials))
 
     # テキストブロックを抽出
     output_text = ""

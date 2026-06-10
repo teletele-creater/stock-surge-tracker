@@ -4,7 +4,7 @@ notes/ 以下のMarkdownを読みやすいHTMLに変換する
 """
 
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from config import NOTES_DIR
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -44,7 +44,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <h1>📈 株価上昇理由メモ</h1>
-<div class="updated">@shodousan | 最終更新: {updated} UTC | {count} 件</div>
+<div class="updated">@shodousan | 最終更新: {updated} JST | {count} 件</div>
 {cards}
 </body>
 </html>"""
@@ -172,7 +172,7 @@ def generate_html() -> Path:
         cards_html = '<div class="card"><p>まだメモがありません。main.py を実行してください。</p></div>'
 
     html = HTML_TEMPLATE.format(
-        updated=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+        updated=datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M"),
         count=len(md_files),
         cards=cards_html,
     )
