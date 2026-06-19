@@ -164,13 +164,18 @@ def fetch_new_surge_tweets(market_hours_only: bool = True, limit: int | None = N
             day = now.strftime("%Y-%m-%d")
             mats = fetch_materials(cand.code, day)
             has_materials = bool(mats["tdnet"] or mats["news"])
-            if _should_defer_for_materials(cand.code, day, has_materials):
+            # ニュース源(株探)の取得が健全なときだけ「空＝まだ材料なし」を信頼して持ち越す。
+            # 材料APIが不通なら待っても無駄＆銘柄を塩漬けにするので持ち越さず続行する。
+            sources_healthy = mats.get("news_ok", True)
+            effective = has_materials or not sources_healthy
+            if _should_defer_for_materials(cand.code, day, effective):
                 n = _defer_counts[(day, cand.code)]
                 print(f"  [kyutou] {cand.code} {cand.name}: 材料未出のため持ち越し "
                       f"({n}/{MATERIAL_MAX_DEFER}) — 次ティックで再評価")
                 continue
             if not has_materials:
-                print(f"  [kyutou] {cand.code} {cand.name}: 持ち越し上限到達、材料なしで続行")
+                reason = "材料なし(API不通)" if not sources_healthy else "持ち越し上限到達"
+                print(f"  [kyutou] {cand.code} {cand.name}: {reason}、材料なしで続行")
             _state.mark_detected(cand.code)
         tweets.append(_to_tweet(cand, result, now))
         if limit is not None and len(tweets) >= limit:
