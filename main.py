@@ -50,6 +50,26 @@ sys.stderr = _configure_console_stream(sys.stderr)
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
+# @shodousan経由のツイートは「初動（動いた直後）」に投稿される。一方 yfinance/Yahoo の
+# 日本株データは公式に20分ディレイ（Yahoo APIの exchangeDataDelayedBy=20 で実測確認）。
+# データは常に「現在−20分」までしか無いため、即処理するとチャートに急騰の陽線が
+# まだ1本も乗らない。そこでツイートからこの分数が経過するまで処理を保留し、
+# 急騰の足が配信されるのを待つ。20分の壁＋急騰直後の足を数分含める余裕で22分。
+# ※20分未満にすると原理的に陽線は出ない（壁を超えないため）。kyutou経由は材料持ち越しで
+#   実質遅延が入るので対象外（0分）。
+SHODOUSAN_MIN_AGE_MIN = 22
+# タイムスタンプ不正なツイートが無限保留にならないための上限。
+SHODOUSAN_MAX_DEFER = 12
+_shodousan_defer_counts: dict[str, int] = {}
+
+
+def _tweet_age_minutes(tweet) -> float:
+    """ツイート投稿からの経過分。created_atがnaiveならUTCとみなす。"""
+    ca = tweet.created_at
+    if ca.tzinfo is None:
+        ca = ca.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ca).total_seconds() / 60.0
+
 
 def get_japanese_greeting() -> str:
     """現在時刻に応じた日本語の挨拶を返す"""
@@ -350,7 +370,7 @@ def run_watch(interval_min: int = 5, post: bool = False, slack: bool = False, au
                 print(f"[INFO] {reason}: queued {queued} post(s)")
         _resume_pending_posts(post=post, slack=slack, auto=auto, reason=reason)
 
-    def _process_tweets(tweets, phase_label: str):
+    def _process_tweets(tweets, phase_label: str, min_age_min: float = 0):
         # クロスソースの当日重複防止: @shodousan / kyutou をまたいで同一銘柄は1日1回だけ
         from storage import was_code_handled_today, mark_code_handled_today
 
@@ -362,6 +382,22 @@ def run_watch(interval_min: int = 5, post: bool = False, slack: bool = False, au
         print(f"[INFO] {phase_label}: processing {len(tweets)} tweet(s)")
         for tweet in tweets:
             primary = tweet.stock_codes[0] if tweet.stock_codes else None
+            # ツイートが新しすぎる間は保留（Yahoo 20分ディレイでチャートに陽線が乗るのを待つ）。
+            # @shodousan経由のみ（min_age_min>0）。tweetはsince_idで再取得され続けるので、
+            # ここで処理しなければ次ティック以降に再評価される。
+            if min_age_min > 0:
+                age = _tweet_age_minutes(tweet)
+                if age < min_age_min:
+                    cnt = _shodousan_defer_counts.get(tweet.id, 0) + 1
+                    if cnt <= SHODOUSAN_MAX_DEFER:
+                        _shodousan_defer_counts[tweet.id] = cnt
+                        print(f"[WAIT] {phase_label}: {primary or tweet.id} は投稿から"
+                              f"{age:.0f}分（<{min_age_min:.0f}分）。陽線待ちで保留 "
+                              f"({cnt}/{SHODOUSAN_MAX_DEFER})")
+                        continue
+                    print(f"[INFO] {phase_label}: {primary or tweet.id} 保留上限到達、"
+                          "経過時間不明として処理続行")
+                _shodousan_defer_counts.pop(tweet.id, None)
             # 分析前チェック（Claude呼び出しを節約）
             if primary and was_code_handled_today(primary):
                 print(f"[SKIP] {phase_label}: {primary} は本日処理済み（重複）")
@@ -403,11 +439,11 @@ def run_watch(interval_min: int = 5, post: bool = False, slack: bool = False, au
         if last_id:
             print(f"\n[INFO] startup check: looking for tweets newer than {last_id}")
             startup_tweets = fetch_tweets(since_id=last_id, max_count=20, today_only=False)
-            _process_tweets(startup_tweets, "startup")
+            _process_tweets(startup_tweets, "startup", min_age_min=SHODOUSAN_MIN_AGE_MIN)
         else:
             print("\n[INFO] startup check: no saved state, importing latest tweets")
             startup_tweets = fetch_tweets(max_count=20, today_only=False)
-            _process_tweets(startup_tweets, "initial import")
+            _process_tweets(startup_tweets, "initial import", min_age_min=SHODOUSAN_MIN_AGE_MIN)
     except Exception as e:
         print(f"[ERROR] startup check failed (continuing to watch loop): {e}")
 
@@ -437,7 +473,8 @@ def run_watch(interval_min: int = 5, post: bool = False, slack: bool = False, au
                 if source == "shodousan":
                     current_last_id = get_last_tweet_id() or last_id
                     new_tweets = fetch_tweets(since_id=current_last_id, max_count=20, today_only=False)
-                    analyses = _process_tweets(new_tweets, f"shodousan {now_str}")
+                    analyses = _process_tweets(new_tweets, f"shodousan {now_str}",
+                                               min_age_min=SHODOUSAN_MIN_AGE_MIN)
                     if analyses:
                         last_id = get_last_tweet_id() or last_id
                 else:
