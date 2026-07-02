@@ -1,12 +1,10 @@
 name: Update stock prices
 
-# JST 平日 9:07〜16:07 を1時間間隔でカバー (UTC -9h)
-# 毎時 7分 にずらしてピーク時刻(00分)のスキップ回避
-# UTC換算: 月-金 0:07, 1:07, ..., 7:07 (= JST 9:07, 10:07, ..., 16:07)
+# 起動は外部スケジューラ (cron-job.org) からの workflow_dispatch で行う。
+# GitHub 純正の schedule cron は発火が不安定なため使用しない。
+# cron-job.org が平日 JST 9:00-16:00 / 15分間隔で叩く。
 on:
-  schedule:
-    - cron: "7 0-7 * * 1-5"
-  workflow_dispatch:        # GitHub UI から手動実行可能
+  workflow_dispatch:        # cron-job.org / GitHub UI から起動
 
 # 同時実行を抑止 (前のrunがYahooを叩いている最中に次のrunが重なるのを防ぐ)
 concurrency:
@@ -20,10 +18,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: "pip"
