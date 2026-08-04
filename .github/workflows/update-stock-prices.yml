@@ -1,10 +1,19 @@
 name: Update stock prices
 
 # 起動は外部スケジューラ (cron-job.org) からの workflow_dispatch で行う。
-# GitHub 純正の schedule cron は発火が不安定なため使用しない。
+# GitHub 純正の schedule cron は発火が不安定なため、ザラ場中の定期実行には使わない。
 # cron-job.org が平日 JST 9:00-16:00 / 15分間隔で叩く。
+#
+# update_stock_prices.py は yf.download のバッチ取得 (80銘柄/回) になり、
+# surge_events の全銘柄 (約840) でも1回あたり数分で終わるため、
+# 毎回全銘柄を更新する (旧: 直近30日の銘柄のみ → 古い銘柄の価格が止まる不具合があった)。
+#
+# schedule は大引け後のバックアップ。cron-job.org が止まっていても
+# 平日1回は全銘柄が終値で更新されるようにする (GH schedule は数十分遅延し得るが許容)。
 on:
   workflow_dispatch:        # cron-job.org / GitHub UI から起動
+  schedule:
+    - cron: "37 7 * * 1-5"  # JST 16:37 (UTC 07:37) 平日 — 大引け後バックアップ
 
 # 同時実行を抑止 (前のrunがYahooを叩いている最中に次のrunが重なるのを防ぐ)
 concurrency:
@@ -29,7 +38,7 @@ jobs:
       - name: Install minimal deps
         run: |
           python -m pip install --upgrade pip
-          pip install python-dotenv
+          pip install python-dotenv yfinance
 
       - name: Run update_stock_prices.py
         env:
