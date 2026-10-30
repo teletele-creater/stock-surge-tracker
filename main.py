@@ -62,6 +62,12 @@ SHODOUSAN_MIN_AGE_MIN = 22
 SHODOUSAN_MAX_DEFER = 12
 _shodousan_defer_counts: dict[str, int] = {}
 
+# 急落検知(drop_events)は 2026-09-02 にこの監視ループから外した。
+# ザラ場スキャンは前日終値をキャッシュから取る作りで、そのキャッシュを更新する
+# sync_prices() がこのループを通らないため、1ヶ月前の終値と比較して株式分割を
+# -70%の急落として拾う不具合があった。引け後に drop_detector.py を1日1回
+# 走らせる運用(run_drop_analysis.bat)に変更している。
+
 
 def _tweet_age_minutes(tweet) -> float:
     """ツイート投稿からの経過分。created_atがnaiveならUTCとみなす。"""
@@ -199,7 +205,7 @@ def _queue_post_requests(analyses, *, force: bool = False) -> int:
 
     queued = 0
     for analysis in analyses:
-        queue_pending_post(
+        added = queue_pending_post(
             analysis.tweet.id,
             analysis.stock_code,
             analysis.stock_name,
@@ -210,7 +216,12 @@ def _queue_post_requests(analyses, *, force: bool = False) -> int:
             backgrounds=analysis.backgrounds,
             force=force,
         )
-        queued += 1
+        if added:
+            queued += 1
+        else:
+            print(f"  [SKIP] X投稿済みのため再投稿しません: "
+                  f"{analysis.stock_code} {analysis.stock_name} "
+                  f"(再投稿するには --force-recent を使用)")
     return queued
 
 
@@ -345,7 +356,8 @@ def run_watch(interval_min: int = 5, post: bool = False, slack: bool = False):
         print("\n\n👋 監視を終了しました")
 
 
-def run_watch(interval_min: int = 5, post: bool = False, slack: bool = False, auto: bool = False):
+def run_watch(interval_min: int = 5, post: bool = False, slack: bool = False,
+              auto: bool = False):
     """Watch for new tweets, analyze them, and optionally run posting flows."""
     from fetcher import fetch_tweets
     from analyzer import analyze_tweet
@@ -684,7 +696,8 @@ def main():
     elif args.latest:
         run_latest(post=args.post, slack=args.slack, auto=args.auto_post)
     elif args.watch is not None:
-        run_watch(interval_min=args.watch, post=args.post, slack=args.slack, auto=args.auto_post)
+        run_watch(interval_min=args.watch, post=args.post, slack=args.slack,
+                  auto=args.auto_post)
     else:
         run(fetch_all=args.all, post=args.post, slack=args.slack, auto=args.auto_post)
 

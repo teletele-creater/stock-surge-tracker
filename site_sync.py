@@ -11,7 +11,12 @@
 import os
 import re
 import requests
-from datetime import timezone, timedelta
+import json
+import logging
+import time
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
 
 from analyzer import Analysis
 
@@ -22,6 +27,69 @@ SUPABASE_TABLE  = os.getenv("SUPABASE_TABLE",  "surge_events")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "charts")
 
 TIMEOUT_SEC = 20
+CHART_MAX_ATTEMPTS = 3
+CHART_RETRY_DELAY_SEC = 5
+CHART_LOG_PATH = Path(__file__).resolve().parent / "logs" / "chart_retry.log"
+
+
+def _log_chart_attempt(analysis, attempt: int, stage: str, outcome: str, error=None):
+    """Persist each attempt without depending on console redirection."""
+    event = {
+        "time": datetime.now(timezone(timedelta(hours=9))).isoformat(),
+        "tweet_id": str(analysis.tweet.id),
+        "stock_code": _clean(analysis.stock_code),
+        "attempt": attempt,
+        "max_attempts": CHART_MAX_ATTEMPTS,
+        "stage": stage,
+        "outcome": outcome,
+    }
+    if error is not None:
+        detail = f"{type(error).__name__}: {error}"
+        if SUPABASE_KEY:
+            detail = detail.replace(SUPABASE_KEY, "[REDACTED]")
+        event["error"] = detail[:1000]
+    message = json.dumps(event, ensure_ascii=False)
+    print(f"  [Chart] {message}")
+    try:
+        logger = logging.getLogger("stock_memo.chart_retry")
+        if not logger.handlers:
+            CHART_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            handler = RotatingFileHandler(CHART_LOG_PATH, maxBytes=5_000_000,
+                                          backupCount=3, encoding="utf-8", delay=True)
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            logger.addHandler(handler)
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+        logger.info(message)
+    except OSError as exc:
+        print(f"  [Chart] log write failed: {type(exc).__name__}")
+
+
+def _prepare_chart_with_retries(analysis: Analysis) -> str | None:
+    """Try generation/upload three times, then let the text post proceed."""
+    image_bytes = None
+    for attempt in range(1, CHART_MAX_ATTEMPTS + 1):
+        stage = "generate" if image_bytes is None else "upload"
+        _log_chart_attempt(analysis, attempt, stage, "started")
+        try:
+            if image_bytes is None:
+                from image_generator import generate_card
+                image_bytes = generate_card(analysis)
+                if not image_bytes:
+                    image_bytes = None
+                    raise ValueError("chart generation returned no image")
+            stage = "upload"
+            chart_url = _upload_chart(analysis.tweet.id, image_bytes)
+            if not chart_url:
+                raise RuntimeError("chart upload returned no URL")
+            _log_chart_attempt(analysis, attempt, stage, "success")
+            return chart_url
+        except Exception as exc:
+            _log_chart_attempt(analysis, attempt, stage, "failed", exc)
+            if attempt < CHART_MAX_ATTEMPTS:
+                time.sleep(CHART_RETRY_DELAY_SEC)
+    _log_chart_attempt(analysis, CHART_MAX_ATTEMPTS, "fallback", "continue_without_image")
+    return None
 
 
 # ─────────────────────────────────────────────
@@ -58,31 +126,15 @@ def _upload_chart(tweet_id: str, image_bytes: bytes) -> str | None:
         "Cache-Control": "public, max-age=86400",
     }
 
-    try:
-        resp = requests.post(upload_url, headers=headers, data=image_bytes, timeout=TIMEOUT_SEC)
-        if resp.status_code in (200, 201):
+    resp = requests.post(upload_url, headers=headers, data=image_bytes, timeout=TIMEOUT_SEC)
+    if resp.status_code in (200, 201):
+        return public_url
+    # 同名ファイル存在 → PUT で上書き
+    if resp.status_code in (400, 409):
+        resp = requests.put(upload_url, headers=headers, data=image_bytes, timeout=TIMEOUT_SEC)
+        if resp.ok:
             return public_url
-        # 同名ファイル存在 → PUT で上書き
-        if resp.status_code in (400, 409):
-            resp = requests.put(upload_url, headers=headers, data=image_bytes, timeout=TIMEOUT_SEC)
-            if resp.ok:
-                return public_url
-        print(f"  [Site] チャートUP失敗 ({resp.status_code}): {resp.text[:200]}")
-        return None
-    except Exception as e:
-        print(f"  [Site] チャートUP例外: {e}")
-        return None
-
-
-# ─────────────────────────────────────────────
-def _generate_chart_safely(analysis: Analysis) -> bytes | None:
-    """急騰チャート画像を生成。失敗してもサイト送信は続行する"""
-    try:
-        from image_generator import generate_card
-        return generate_card(analysis)
-    except Exception as e:
-        print(f"  [Site] チャート生成スキップ: {e}")
-        return None
+    raise RuntimeError(f"chart upload HTTP {resp.status_code}: {resp.text[:200]}")
 
 
 # ─────────────────────────────────────────────
@@ -99,9 +151,8 @@ def sync_to_site(analysis: Analysis) -> bool:
 
     tweet = analysis.tweet
 
-    # 1) チャート画像を生成してアップロード（失敗しても続行）
-    image_bytes = _generate_chart_safely(analysis)
-    chart_url   = _upload_chart(tweet.id, image_bytes) if image_bytes else None
+    # 1) 最大3回試行。3回とも失敗した場合だけ画像なしで続行。
+    chart_url = _prepare_chart_with_retries(analysis)
 
     # 1.5) 急騰時株価を取得（失敗しても続行）
     surge_price = None
@@ -143,9 +194,21 @@ def sync_to_site(analysis: Analysis) -> bool:
         if resp.ok:
             chart_note = " (画像あり)" if chart_url else ""
             print(f"  [Site] 反映: {row['stock_code']} {row['stock_name']}{chart_note}")
+            _sync_ohlc_safely(row["stock_code"])
             return True
         print(f"  [Site] 送信失敗 ({resp.status_code}): {resp.text[:200]}")
         return False
     except Exception as e:
         print(f"  [Site] 送信例外: {e}")
         return False
+
+
+# ─────────────────────────────────────────────
+def _sync_ohlc_safely(code: str) -> None:
+    """リアルチャート用の OHLC（日足/週足）を同期。失敗してもフローは止めない。
+    stock_ohlc テーブル未作成・yfinance未導入の場合は静かにスキップされる。"""
+    try:
+        from sync_ohlc import sync_codes
+        sync_codes([code])
+    except Exception as e:
+        print(f"  [Site] OHLC同期スキップ: {e}")

@@ -34,7 +34,22 @@ notes/*.html
 # 作業用ディレクトリ・アーカイブ
 _unzipped/
 filesweb.zip
-!doctype html.txt
+\!doctype html.txt
 
 # Claude Code worktrees
 .claude/
+
+# 個人メモ・原稿 (公開不要)
+*.txt
+!requirements.txt
+
+# 分析の出力物・キャッシュ・ログ
+analysis_out/*
+!analysis_out/cache/
+analysis_out/cache/*
+!analysis_out/cache/reason_categories.json
+logs/
+*.csv
+*.pdf
+*.png
+*.zip

@@ -178,6 +178,18 @@ def generate_card(analysis) -> bytes:
     except Exception as e:
         logger.warning(f"yfinance fetch failed for {stock_code}: {e}")
 
+    # 前日比騰落率（画像を流し見する層向けにヘッダへ大きく出す）
+    # 当日足は _patch_today_with_intraday で実値化済みなので、直近2本の終値から計算
+    change_pct = None
+    if hist is not None and len(hist) >= 2:
+        try:
+            prev_close = float(hist["Close"].iloc[-2])
+            last_close = float(hist["Close"].iloc[-1])
+            if prev_close > 0:
+                change_pct = (last_close / prev_close - 1.0) * 100.0
+        except Exception as e:
+            logger.warning(f"change pct calc failed: {e}")
+
     fig = plt.figure(figsize=(FIG_W_IN, FIG_H_IN), dpi=DPI, facecolor="white")
     ASPECT = FIG_W_IN / FIG_H_IN
 
@@ -197,6 +209,16 @@ def generate_card(analysis) -> bytes:
     ax_header.text(0.015, 0.93, "※株価急騰要因",
                    fontsize=34, color="#1a1a1a", fontweight="bold",
                    transform=ax_header.transAxes, va="top")
+
+    # 騰落率をヘッダ右上に大きく表示（陽線=赤・陰線=青のチャート配色と揃える）
+    if change_pct is not None:
+        pct_color = "#D93030" if change_pct >= 0 else "#1E5AA8"
+        ax_header.text(0.985, 0.70, f"{change_pct:+.1f}%",
+                       fontsize=52, color=pct_color, fontweight="bold",
+                       transform=ax_header.transAxes, ha="right", va="center")
+        ax_header.text(0.985, 0.24, "前日比",
+                       fontsize=15, color="#888888",
+                       transform=ax_header.transAxes, ha="right", va="center")
 
     # 銘柄名 (大・黒) + コード (小・グレー) を横並び
     # 名前が長すぎる場合はフォント縮小
@@ -369,6 +391,14 @@ def generate_card(analysis) -> bytes:
                     color="#e0e0e0", linestyle=(0, (1, 2.5)), linewidth=1,
                 )
                 fig.add_artist(line)
+
+    # ====== FOOTER: サイトの銘柄ページURL ======
+    # 画像自体はクリックできないため、視認用（クリック可能なリンクはポスト本文側に付ける）
+    if stock_code and stock_code != "不明":
+        from config import SITE_BASE_URL
+        site_host = re.sub(r"^https?://", "", SITE_BASE_URL)
+        fig.text(0.965, 0.017, f"詳細・過去の急騰履歴 ▶ {site_host}/#stock/{stock_code}",
+                 fontsize=11, color="#888888", ha="right", va="center")
 
     buf = io.BytesIO()
     fig.savefig(buf, format="PNG", facecolor="white")

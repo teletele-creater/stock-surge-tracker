@@ -3,12 +3,14 @@ X (Twitter) posting helpers using Playwright.
 Builds post text from an analysis result and optionally resumes pending posts.
 """
 
+import re
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from analyzer import Analysis
-from config import AUTH_STATE_FILE
+from config import AUTH_STATE_FILE, SITE_BASE_URL, X_ATTACH_IMAGE
 from storage import discard_pending_post, get_pending_posts, mark_posted
 
 
@@ -21,10 +23,144 @@ def _strip_parens(text: str) -> str:
 
 
 def normalize_post_text(text: str) -> str:
-    """Keep older pending posts compatible when the title line changed."""
-    if text.startswith("【初動メモ】"):
-        return text.replace("【初動メモ】", "※株価急騰要因", 1)
+    """Keep older pending posts compatible when the title line changed.
+
+    タイトル行は2026-07-14に廃止（銘柄行から始める）。旧形式でキュー済みの
+    投稿文からは、先頭のタイトル行を剥がして新形式に揃える。
+    """
+    for old_title in ("※株価急騰要因", "【初動メモ】"):
+        if text.startswith(old_title):
+            return text[len(old_title):].lstrip("\n")
     return text
+
+
+def _extract_change_pct(analysis) -> str | None:
+    """急騰検知の疑似ツイート本文から前日比騰落率を取り出す（例: "+13.28"）。
+
+    kyutou_source が生成する本文の「前日比 +13.28%」を拾う。
+    形式が違う（手動投稿・旧データ等）場合は None を返し、1行目は騰落率なしになる。
+    """
+    text = getattr(getattr(analysis, "tweet", None), "text", "") or ""
+    m = re.search(r"前日比\s*([+＋\-−]?\d+(?:\.\d+)?)\s*[%％]", text)
+    if not m:
+        return None
+    pct = m.group(1).replace("＋", "+").replace("−", "-")
+    if pct and pct[0] not in "+-":
+        pct = "+" + pct
+    return pct
+
+
+def _fetch_stats_via_yfinance(stock_code: str) -> tuple[float, float, float | None] | None:
+    """(現在値, 前日比%, 出来高比) を yfinance から取得する。
+
+    kyutou の疑似ツイートと違い @shodousan のツイート本文には株価・出来高が無いため、
+    こちらで補完する。出来高比は「当日出来高 ÷ 直近5営業日の平均出来高」。
+    当日足は未確定・遅延のことがあるので分足の実値で上書きしてから計算する。
+    """
+    try:
+        import yfinance as yf
+        from image_generator import _patch_today_with_intraday
+        ticker = yf.Ticker(f"{stock_code}.T")
+        hist = ticker.history(period="1mo")
+        hist = _patch_today_with_intraday(ticker, hist)
+        if hist is None or len(hist) < 2:
+            return None
+        price = float(hist["Close"].iloc[-1])
+        prev_close = float(hist["Close"].iloc[-2])
+        if prev_close <= 0:
+            return None
+        pct = (price / prev_close - 1.0) * 100.0
+        vol_ratio = None
+        if "Volume" in hist.columns and len(hist) >= 6:
+            avg_vol = float(hist["Volume"].iloc[-6:-1].mean())
+            if avg_vol > 0:
+                vol_ratio = float(hist["Volume"].iloc[-1]) / avg_vol
+        return price, pct, vol_ratio
+    except Exception as e:
+        print(f"  [WARN] 株価データ補完失敗 {stock_code}: {e}")
+        return None
+
+
+def _volume_line(ratio_str: str) -> str:
+    """出来高比の行を組み立てる。特に高い（3倍以上）ときは🔥で強調する。"""
+    line = f"出来高比 {ratio_str}倍"
+    try:
+        if float(ratio_str) >= 3:
+            line += " 🔥"
+    except ValueError:
+        pass
+    return line
+
+
+def _build_stats_lines(analysis) -> list[str]:
+    """銘柄行直下の数字行（株価・前日比%・出来高比、各1行）を組み立てる。
+
+    数字は kyutou_source の疑似ツイート本文から抽出し、無ければ（@shodousan の
+    初動検知ツイート等）yfinance で補完する。どちらも取れなければ空リスト
+    （数字行なしのフォーマットになる）。
+    """
+    text = getattr(getattr(analysis, "tweet", None), "text", "") or ""
+    lines = []
+
+    m_price = re.search(r"株価\s*([\d,]+(?:\.\d+)?)\s*円", text)
+    if m_price:
+        price = float(m_price.group(1).replace(",", ""))
+        pct = _extract_change_pct(analysis)
+        if pct:
+            lines.append(f"株価 {price:,.0f}円（前日比 {pct}%）")
+        else:
+            lines.append(f"株価 {price:,.0f}円")
+
+        m_vol = re.search(r"出来高比\s*([\d.]+)\s*倍", text)
+        if m_vol:
+            lines.append(_volume_line(m_vol.group(1)))
+        return lines
+
+    # 本文に数字なし → yfinance で補完
+    stock_code = _strip_parens(getattr(analysis, "stock_code", "") or "")
+    if not stock_code or stock_code == "不明":
+        return []
+    stats = _fetch_stats_via_yfinance(stock_code)
+    if stats is None:
+        return []
+    price, pct, vol_ratio = stats
+    lines.append(f"株価 {price:,.0f}円（前日比 {pct:+.2f}%）")
+    if vol_ratio is not None:
+        lines.append(_volume_line(f"{vol_ratio:.2f}"))
+    return lines
+
+
+def site_stock_url(stock_code: str, when: datetime | None = None) -> str | None:
+    """サイトの銘柄詳細ページへの直リンクURLを返す（コード不明なら None）。
+
+    パス形式 /stock/{code}/{YYYYMMDD} を使う。Cloudflare Pages の _worker.js が
+    このパスで OGP メタタグ（og:image=チャート画像）を返すので、X がリンクカードを
+    描画し、ブラウザは /#stock/{code}（SPA の銘柄詳細）へリダイレクトされる。
+
+    日付を付けるのは X のカードキャッシュ対策。X はURL単位でカードを数日キャッシュ
+    するため、同じ銘柄が再急騰したときに古い（または画像取得に失敗した）カードが
+    使い回されて「チャートが表示されない」ことがある。
+    """
+    code = _strip_parens(stock_code or "")
+    if not code or code == "不明":
+        return None
+    jst = timezone(timedelta(hours=9))
+    stamp = when or datetime.now(jst)
+    if stamp.tzinfo is not None:
+        stamp = stamp.astimezone(jst)
+    day = stamp.strftime("%Y%m%d")
+    return f"{SITE_BASE_URL}/stock/{code}/{day}"
+
+
+def append_site_link(text: str, stock_code: str, when: datetime | None = None) -> str:
+    """ポスト本文の末尾にサイトの銘柄ページリンクを付ける。
+
+    既にサイトURLが含まれている場合（キュー済みの新形式ポスト等）は二重に付けない。
+    """
+    url = site_stock_url(stock_code, when)
+    if not url or SITE_BASE_URL in text:
+        return text
+    return f"{text}\n\n📊 チャート・過去の急騰履歴\n{url}"
 
 
 def build_post_text(analysis: Analysis) -> str:
@@ -33,7 +169,7 @@ def build_post_text(analysis: Analysis) -> str:
     keywords = _strip_parens(analysis.keywords)
 
     backgrounds = (
-        "\n".join(f"・{_strip_parens(bg)}" for bg in analysis.backgrounds)
+        "\n\n".join(f"・{_strip_parens(bg)}" for bg in analysis.backgrounds)
         if analysis.backgrounds
         else "・関連情報なし"
     )
@@ -50,23 +186,28 @@ def build_post_text(analysis: Analysis) -> str:
     stock_code = _strip_parens(analysis.stock_code)
     stock_label = f"{stock_name}({stock_code})" if stock_name else stock_code
 
+    # 銘柄行の直下に数字行（株価・前日比%・出来高比）を添える
+    stats_lines = _build_stats_lines(analysis)
+    stats_block = "\n".join(stats_lines) + "\n\n" if stats_lines else ""
+
     text = (
-        "※株価急騰要因\n"
+        f"📈 {stock_label}　大幅上昇❗️\n"
         "\n"
-        f"{stock_label}\n"
+        f"{stats_block}"
+        f"✅ {reason}によるもの\n"
         "\n"
-        f"{reason}によるもの\n"
+        f"🏢 事業内容：\n{_strip_parens(analysis.business)}\n"
         "\n"
-        f"事業内容:{_strip_parens(analysis.business)}\n"
+        f"🔑 キーワード：\n{keywords}\n"
         "\n"
-        f"キーワード:{keywords}\n"
-        "\n"
+        f"📝 強材料ポイント\n"
         f"{backgrounds}\n"
         "\n"
-        "関連銘柄\n"
+        "🔗 関連銘柄\n"
         f"{related_stocks}"
     )
-    return normalize_post_text(text.strip())
+    detected_at = getattr(getattr(analysis, "tweet", None), "created_at", None)
+    return append_site_link(normalize_post_text(text.strip()), stock_code, detected_at)
 
 
 def confirm_and_post(analysis: Analysis) -> bool:
@@ -109,9 +250,12 @@ def _generate_card_safely(analysis_like) -> bytes | None:
 
 
 def auto_post(analysis: Analysis) -> bool:
-    """Post directly to X without any approval step (with image)."""
+    """Post directly to X without any approval step.
+
+    既定はカード方式（画像添付なし）。X_ATTACH_IMAGE=1 のときのみ画像を添付する。
+    """
     text = build_post_text(analysis)
-    image_bytes = _generate_card_safely(analysis)
+    image_bytes = _generate_card_safely(analysis) if X_ATTACH_IMAGE else None
 
     print(f"\n[AUTO] posting to X: {analysis.stock_code} {analysis.stock_name}")
     success = _post_to_x(text, image_bytes=image_bytes)
@@ -136,7 +280,9 @@ def process_pending_auto_queue() -> list[bool]:
     for index, entry in enumerate(pending_posts, 1):
         stock_code = entry.get("stock_code", "")
         stock_name = entry.get("stock_name", "")
-        post_text = normalize_post_text(entry.get("post_text", ""))
+        post_text = append_site_link(
+            normalize_post_text(entry.get("post_text", "")), stock_code
+        )
         tweet_id = entry.get("tweet_id", "")
 
         analysis_like = SimpleNamespace(
@@ -147,7 +293,7 @@ def process_pending_auto_queue() -> list[bool]:
             keywords=entry.get("keywords", ""),
             backgrounds=entry.get("backgrounds", []) or [],
         )
-        image_bytes = _generate_card_safely(analysis_like)
+        image_bytes = _generate_card_safely(analysis_like) if X_ATTACH_IMAGE else None
 
         print(f"\n[AUTO {index}/{len(pending_posts)}] {stock_code} {stock_name}")
         success = _post_to_x(post_text, image_bytes=image_bytes)
@@ -172,7 +318,9 @@ def process_pending_terminal_queue() -> list[bool]:
     for index, entry in enumerate(pending_posts, 1):
         stock_code = entry.get("stock_code", "")
         stock_name = entry.get("stock_name", "")
-        post_text = normalize_post_text(entry.get("post_text", ""))
+        post_text = append_site_link(
+            normalize_post_text(entry.get("post_text", "")), stock_code
+        )
         tweet_id = entry.get("tweet_id", "")
 
         print("\n" + "=" * 50)

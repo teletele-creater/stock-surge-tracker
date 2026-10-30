@@ -136,17 +136,20 @@ def queue_pending_post(
     keywords: str = "",
     backgrounds: list[str] | None = None,
     force: bool = False,
-) -> None:
+) -> bool:
     """Queue a post for approval, optionally storing analysis fields needed for
     regenerating the chart image after a process restart.
 
     Args:
         force: If True, skip the posted_ids check (allows re-queueing of
                already-posted tweets, used by --force-recent).
+
+    Returns:
+        True if queued (or updated), False if skipped as already posted.
     """
     state = _load_state()
     if not force and tweet_id in state.get("posted_ids", []):
-        return
+        return False
 
     extra_fields = {
         "reason": reason,
@@ -163,7 +166,7 @@ def queue_pending_post(
             entry["post_text"] = post_text
             entry.update(extra_fields)
             _save_state(state)
-            return
+            return True
 
     pending_posts.append({
         "tweet_id": tweet_id,
@@ -173,6 +176,7 @@ def queue_pending_post(
         **extra_fields,
     })
     _save_state(state)
+    return True
 
 
 def discard_pending_post(tweet_id: str) -> None:

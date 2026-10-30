@@ -90,7 +90,11 @@ def fetch_events(limit: int | None = None) -> pd.DataFrame:
     while True:
         url = (
             f"{SUPABASE_URL}/rest/v1/{EVENTS_TABLE}"
-            f"?select=id,tweet_id,stock_code,stock_name,detected_at,reason,surge_price,keywords"
+            # business / backgrounds / related_stocks / raw_post は長らく未取得
+            # だったが、reason(20字程度の要約)より情報量が桁違いに多いので
+            # 予測特徴の材料として引く。
+            f"?select=id,tweet_id,stock_code,stock_name,detected_at,reason,"
+            f"surge_price,keywords,business,backgrounds,related_stocks,raw_post"
             f"&order=detected_at.desc&offset={offset}&limit={page}"
         )
         r = requests.get(url, headers=_headers(), timeout=TIMEOUT)
@@ -119,6 +123,43 @@ def fetch_events(limit: int | None = None) -> pd.DataFrame:
         return frozenset()
 
     df["kwset"] = df["keywords"].apply(_kwset)
+
+    # ── リッチフィールドから構造的な特徴を作る ─────────────────
+    # 強材料ポイント(backgrounds)は「材料がどれだけ厚いか」、related_stocks は
+    # 「テーマの裾野の広さ」の代理変数になる。いずれも急騰検知時点で確定して
+    # いるので押し目の予測に使っても先読みにならない。
+    def _as_list(v) -> list:
+        if isinstance(v, list):
+            return [str(x) for x in v if str(x).strip()]
+        if isinstance(v, str) and v.strip():
+            return [v]
+        return []
+
+    bg = df["backgrounds"].apply(_as_list)
+    df["n_backgrounds"] = bg.apply(len)
+    df["len_backgrounds"] = bg.apply(lambda L: sum(len(x) for x in L))
+    df["backgrounds_text"] = bg.apply(lambda L: " / ".join(L))
+    df["n_keywords"] = df["kwset"].apply(len)
+    df["business"] = df["business"].fillna("").astype(str).str.strip()
+    df["len_business"] = df["business"].str.len()
+
+    rel = df["related_stocks"].fillna("").astype(str)
+    # 「4183: 三井化学 — ...」の形で列挙されるので銘柄コードの出現数を数える
+    df["n_related"] = rel.apply(lambda s: len(re.findall(r"\b\d{4}[A-Z]?\s*[:：]", s)))
+    # 「省略」と書かれた埋め草を除いた実質的な関連銘柄数
+    df["n_related_real"] = rel.apply(
+        lambda s: sum(1 for ln in re.split(r"[/\n]", s)
+                      if re.search(r"\d{4}[A-Z]?\s*[:：]", ln) and "省略" not in ln))
+
+    # raw_post の数値(自前検知 kyutou のみ。shodousan は銘柄名とURLだけ)
+    rp = df["raw_post"].fillna("").astype(str)
+
+    def _num(pat):
+        return pd.to_numeric(rp.str.extract(pat, expand=False), errors="coerce")
+
+    df["post_surge_pct"] = _num(r"前日比\s*\+?(-?[\d.]+)\s*%")
+    df["post_vol_ratio"] = _num(r"出来高比\s*([\d.]+)\s*倍")
+    df["post_turnover_oku"] = _num(r"売買代金\s*([\d.]+)\s*億円")
     # 同一銘柄・同一日の重複は最初の1件に絞る
     before = len(df)
     df = df.sort_values("detected_at").drop_duplicates(
@@ -273,21 +314,89 @@ CONT_FOLLOWUP = "続報期待型"    # 同一案件の続報が構造的に想�
 CONT_PERIODIC = "定期イベント型"  # 次の四半期決算という確定カタリスト持ち
 CONT_ONESHOT = "一過性完結型"   # 続報の出ようがない単発イベント
 CONT_EXTERNAL = "外部依存型"    # 自社発ニュースなし。テーマの外部フロー次第
+CONT_BINARY = "バイオ・イベント型"  # 治験結果などバイナリーな一発イベント頼み。押し目反発が弱いため続報期待型と分離
 CONT_UNKNOWN = "分類不能"
 
-RE_CONT_FOLLOWUP = re.compile(
-    r"提携|治験|承認|認可|受注|採択|出資|買収|TOB|契約|協業|共同|導出|上市|"
-    r"開発|特許|参入|子会社|設立|新製品|新サービス|供給|納入|選定|指定"
-)
 RE_CONT_ONESHOT = re.compile(
     r"優待|記念|周年|株式分割|自社株買い|自己株式|増配|復配|配当|累進"
 )
+
+# ── 続報期待スコア ルーブリック ────────────────────────────────
+# 「同じ案件の続報がこの先も出そうか」を材料の構造から加点・減点で採点する。
+# ここ(配点とキーワード)を書き換えるだけで自由に調整できる。LLM不使用・再現可能。
+#   "max"  : マッチした中で最高配点の1件だけ採用(材料タイプの排他選択)
+#   "each" : マッチした各行の配点をすべて加算
+FOLLOWUP_RUBRIC = [
+    ("材料タイプ", "max", [
+        (3, r"治験|臨床|フェーズ|第[IVXｰ0-9]+相|承認申請|薬事|導出|パイプライン"),
+        (2, r"提携|協業|共同|資本業務提携|アライアンス"),
+        (2, r"受注|契約|採択|選定|指定|落札|受託"),
+        (1, r"買収|TOB|M&A|出資|子会社|設立|買付"),
+        (1, r"新製品|新サービス|発売|上市|参入|開発|実用化"),
+    ]),
+    ("段階性", "each", [
+        (2, r"第[1１一]弾|基本合意|MOU|一部|着手|協議|交渉|予定|計画|見込|開始"),
+        (-2, r"完了|最終|満了|解消|終了|撤回|中止"),
+    ]),
+    ("具体性", "each", [
+        # 「」で括られた固有名、または4文字以上のカタカナ語(製品名・社名の目安)
+        (1, r"[「『][^」』]{2,}[」』]|[ァ-ヺー]{4,}"),
+    ]),
+    ("一過性・減点", "each", [
+        (-3, r"優待|記念|周年|株式分割"),
+        (-2, r"増配|復配|配当|自社株買い|自己株式|累進"),
+        (-2, r"としての物色|関連株|関連銘柄"),
+    ]),
+]
+FOLLOWUP_THRESHOLD = 2  # このスコア以上を「続報期待型」とする
+# 注: 現データでは閾値3(治験/パイプライン等の高確度材料)は押し目反発が弱く、
+# 閾値2(提携/受注など中程度材料を含む)の方が押し目シグナルが良好だった。
+
+_FOLLOWUP_COMPILED = [
+    (name, mode, [(pt, re.compile(pat)) for pt, pat in items])
+    for name, mode, items in FOLLOWUP_RUBRIC
+]
+
+# バイオ/創薬: 治験結果というバイナリーイベント頼みで、押し目に継続買いが入りにくい。
+# 続報期待型(提携・受注の"じわじわ続く再評価")とは仕組みが違うため別枠に隔離する。
+RE_BIOTECH = re.compile(
+    r"治験|臨床試験|臨床開発|フェーズ|第[IVXｰ0-9]+相|承認申請|薬事承認|"
+    r"導出|パイプライン|創薬|抗体医薬|治療薬|ワクチン|再生医療|遺伝子治療|"
+    r"希少疾患|バイオ医薬|新薬|治験薬"
+)
+
+
+def followup_score(reason: str, breakdown: bool = False):
+    """続報期待スコアを計算する。breakdown=True なら (score, 内訳dict) を返す。"""
+    if not reason:
+        return (0, {}) if breakdown else 0
+    total = 0
+    detail = {}
+    for name, mode, items in _FOLLOWUP_COMPILED:
+        hits = [pt for pt, rx in items if rx.search(reason)]
+        if not hits:
+            continue
+        pt = max(hits) if mode == "max" else sum(hits)
+        total += pt
+        detail[name] = pt
+    return (total, detail) if breakdown else total
+
+
+# 「未確定」= 材料がまだ期待・思惑の段階で終わっている(=買う理由が消費されていない)。
+# 具体材料(続報期待型)と掛け合わせたときに押し目反発が跳ね上がる中核シグナル。
+RE_UNRESOLVED_TAIL = re.compile(r"(期待|思惑|観測|憶測|見通し|期待感|人気化)$")
+
+
+def is_unresolved(reason: str) -> bool:
+    return bool(RE_UNRESOLVED_TAIL.search((reason or "").strip()))
 
 
 def classify_continuation(reason: str) -> str:
     if not reason:
         return CONT_UNKNOWN
-    if RE_CONT_FOLLOWUP.search(reason):
+    if RE_BIOTECH.search(reason):
+        return CONT_BINARY
+    if followup_score(reason) >= FOLLOWUP_THRESHOLD:
         return CONT_FOLLOWUP
     if RE_EARN.search(reason):
         return CONT_PERIODIC
@@ -303,7 +412,9 @@ REDETECT_WINDOW = 30    # 再検知の観測窓(暦日)
 
 
 def add_followup_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """継続性タイプ・テーマ過熱度・再検知フラグを付与する(全て実測/ルールのみ)。"""
+    """継続性タイプ・続報期待スコア・テーマ過熱度・再検知フラグを付与する(全て実測/ルールのみ)。"""
+    df["followup_score"] = df["reason"].apply(followup_score)
+    df["unresolved"] = df["reason"].apply(is_unresolved)
     df["continuation_type"] = df["reason"].apply(classify_continuation)
 
     # テーマ過熱度: 直近14日(当日含む)に同一キーワードを1つ以上共有する
@@ -344,14 +455,19 @@ def load_price_data(codes: list[str]) -> dict[str, pd.DataFrame]:
     OHLC_CACHE.mkdir(parents=True, exist_ok=True)
     data: dict[str, pd.DataFrame] = {}
     missing: list[str] = []
-    today = datetime.now(JST).strftime("%Y-%m-%d")
+    now = datetime.now(JST)
+    # yf.download の end は排他的なので、当日の足を含めるには翌日を指定する。
+    # end=今日 だと大引け後(16:33)の実行でも前日までしか入らず、
+    # 押し目接近の検知が丸1日遅れる(2026-08-20 のセリアで実害)。
+    end = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
     for code in codes:
         f = OHLC_CACHE / f"{code}.csv"
-        # キャッシュが当日取得済みならそれを使う
+        # キャッシュが当日取得済みならそれを使う。日次ジョブは毎日ほぼ同時刻に
+        # 走るので、閾値24hだと前日分(≒24h前)を「新しい」と誤判定する日が出る。
         if f.exists():
             age_h = (time.time() - f.stat().st_mtime) / 3600
-            if age_h < 24:
+            if age_h < 6:
                 try:
                     df = pd.read_csv(f, index_col=0, parse_dates=True)
                     # PRICE_START を広げた場合は古いキャッシュを使わない
@@ -371,7 +487,7 @@ def load_price_data(codes: list[str]) -> dict[str, pd.DataFrame]:
         tickers = [f"{c}.T" for c in batch]
         try:
             raw = yf.download(
-                tickers, start=PRICE_START, end=today, interval="1d",
+                tickers, start=PRICE_START, end=end, interval="1d",
                 group_by="ticker", auto_adjust=False, threads=True, progress=False,
             )
         except Exception as e:
@@ -379,7 +495,9 @@ def load_price_data(codes: list[str]) -> dict[str, pd.DataFrame]:
             continue
         for code, tic in zip(batch, tickers):
             try:
-                df = raw[tic].dropna(subset=["Close"]) if len(batch) > 1 else raw.dropna(subset=["Close"])
+                # group_by="ticker" は1銘柄バッチでも MultiIndex 列を返すことがある
+                sub = raw[tic] if isinstance(raw.columns, pd.MultiIndex) else raw
+                df = sub.dropna(subset=["Close"])
                 if len(df) > 30:
                     df = df[["Open", "High", "Low", "Close", "Volume"]]
                     df.to_csv(OHLC_CACHE / f"{code}.csv")
@@ -556,6 +674,8 @@ def compute_features(df: pd.DataFrame, prices: dict[str, pd.DataFrame],
             "surge_date": d,
             "category": ev["category"],
             "continuation_type": ev["continuation_type"],
+            "followup_score": ev["followup_score"],
+            "unresolved": ev["unresolved"],
             "theme_heat": ev["theme_heat"],
             "redetect_30d": ev["redetect_30d"],
             "reason": ev["reason"],
@@ -736,8 +856,16 @@ def build_report(feat: pd.DataFrame, news: dict | None) -> str:
             L.append(md_table(group_table(nn, "ニュース")))
             L.append("> 文献の予測: ニュースを伴う値動きは継続、ニュースなしは反転(Chan 2003)。\n")
 
-    L.append("## 7. 継続性タイプ(ルール分類・後続材料の出やすさ)\n")
+    L.append("## 7. 継続性タイプ(続報期待スコア≥{}を続報期待型に再定義)\n".format(FOLLOWUP_THRESHOLD))
     L.append(md_table(group_table(sub20, "continuation_type")))
+
+    L.append("### 続報期待スコア帯別\n")
+    sc = sub20.dropna(subset=["followup_score"]).copy()
+    sc["スコア帯"] = pd.cut(sc["followup_score"], bins=[-99, -1, 0, 2, 4, 99],
+                            labels=["減点(<0)", "0", "1-2", "3-4", "5+"])
+    L.append(md_table(group_table(sc, "スコア帯")))
+    L.append("> スコアが高い(=続報が構造的に想定される)ほど維持されやすいかの検証。"
+             "閾値はコード先頭 FOLLOWUP_RUBRIC / FOLLOWUP_THRESHOLD で調整可能。\n")
     L.append("> 仮説: 続報が構造的に想定される材料(続報期待型)や確定カタリスト持ち(定期イベント型)は"
              "維持されやすく、一過性完結型は恒久リプライシング(その水準で完結)、"
              "外部依存型はテーマのニュースフロー次第。再検知率%は実際に30日以内へ後続材料が出た割合。\n")

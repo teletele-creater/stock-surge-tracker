@@ -30,8 +30,10 @@ Xのポストから銘柄を特定し、株価上昇の理由を簡潔・的確�
 分析のポリシー:
 - レポート口調（「〜である」「〜とみられる」「〜が追い風となっている」等）
 - 文章は簡潔に。ただし重要な箇所は丁寧に説明する
-- 理由1は「好決算」「上方修正」「株主優待導入」など、実際の株価急騰のきっかけとなった具体的な材料を記載する。「初動検知」「シグナル検知」のようなシグナル自体を理由にしてはならない。ポストから具体的な材料が読み取れない場合は、その銘柄の直近IRや業績動向から一般的に考えられる材料を推測して記載する
-- 背景は「なぜ業績が良いのか」「何が強みか」という実質的な内容
+- 理由1は「好決算」「上方修正」「株主優待導入」など、実際の株価急騰のきっかけとなった具体的な材料を記載する。「初動検知」「シグナル検知」のようなシグナル自体を理由にしてはならない
+- ポストや与えられた一次情報から具体的な材料が確認できない場合、実在が確認できない開示・イベント（好決算、上方修正、提携など）を事実であるかのように書いてはならない。その場合は、確認できた事実（事業内容・テーマ・市場環境）の範囲で「〜関連としての物色とみられる」のように推測であることが明確に分かる表現にする
+- 銘柄名と事業内容は、与えられた【企業の正式情報】に必ず従う。正式情報と矛盾する記述や、社名からの連想による事業内容の創作は厳禁
+- 背景は「なぜ業績が良いのか」「何が強みか」という実質的な内容。ただしその企業の実際の事業内容と無関係な話を書いてはならない
 - 関連銘柄は同様の恩恵が期待できる具体的な銘柄コードと銘柄名を挙げる
 - 注記・免責・補足説明は一切出力しない"""
 
@@ -116,10 +118,10 @@ def _build_materials_section(materials: dict | None) -> str:
     news_block = "\n".join(f"・{t}" for t in news) if news else "（該当なし）"
     return f"""
 
-【参考: 当日の一次情報（前営業日15時以降〜当日）】
+【参考: 当日の一次情報（前営業日の場中〜当日）】
 ■ TDnet適時開示:
 {tdnet_block}
-■ ニュース見出し（株探）:
+■ ニュース見出し（株探・Yahoo!ファイナンス）:
 {news_block}
 
 上記に急騰の材料となる開示・報道があれば、それを(理由1)として最優先で採用すること。
@@ -127,9 +129,35 @@ def _build_materials_section(materials: dict | None) -> str:
 「ストップ高」「動意株」など結果を伝えるだけの見出しは理由にしないこと。"""
 
 
-def _build_analysis_prompt(tweet: Tweet, materials: dict | None = None) -> str:
+def _build_profile_section(profile: dict | None) -> str:
+    """企業の正式情報（株探の会社情報）をプロンプト追記用に整形する。
+
+    モデルが社名からの連想で事業内容を創作するハルシネーション対策の要。
+    profile が None（取得失敗）の場合は空文字を返し、従来どおり続行する。
+    """
+    if not profile:
+        return ""
+    name = profile.get("name") or "（不明）"
+    summary = profile.get("summary") or "（不明）"
+    sector = profile.get("sector") or "（不明）"
+    themes = "、".join(profile.get("themes") or []) or "（不明）"
+    return f"""
+【企業の正式情報（株探の会社情報より）】
+正式社名: {name}
+事業内容: {summary}
+業種: {sector}
+テーマ: {themes}
+
+銘柄名は上記の正式社名を使い、(事業内容)・(背景)・(キーワード)・関連銘柄は必ず上記と整合させること。
+上記と矛盾する事業内容を記載してはならない。
+"""
+
+
+def _build_analysis_prompt(tweet: Tweet, materials: dict | None = None,
+                           profile: dict | None = None) -> str:
     codes_str = "、".join(tweet.stock_codes) if tweet.stock_codes else "不明"
     materials_section = _build_materials_section(materials)
+    profile_section = _build_profile_section(profile)
     return f"""以下のポストを分析し、株価上昇理由をテンプレートに沿って出力してください。
 
 【ポスト内容】
@@ -137,7 +165,7 @@ def _build_analysis_prompt(tweet: Tweet, materials: dict | None = None) -> str:
 
 【抽出済み銘柄コード】
 {codes_str}
-
+{profile_section}
 【出力テンプレート（()内のみ記入し、それ以外は変更しないこと）】
 銘柄: (銘柄コード) (銘柄名)
 
@@ -153,12 +181,12 @@ def _build_analysis_prompt(tweet: Tweet, materials: dict | None = None) -> str:
 
 【記入ルール】
 1. ()の中に入力し、それ以外のテキストは変更しない
-2. (理由1)は「好決算」「上方修正」「株主優待導入」など、実際に株価が動いたきっかけとなる具体的な材料を記載する。「初動検知」「シグナル」などシグナル自体を理由にしない。ポストから読み取れない場合は直近IRや業績動向から推測する
-3. (事業内容)はその企業が何をしている会社かを1文で簡潔にまとめる
-4. (背景)は好業績の仕組み・独自の強み・市場環境など。情報が多ければ4〜5個記載してもよい
+2. (理由1)は「好決算」「上方修正」「株主優待導入」など、実際に株価が動いたきっかけとなる具体的な材料を記載する。「初動検知」「シグナル」などシグナル自体を理由にしない。ポストと一次情報のどちらからも具体的な材料が確認できない場合は、実在が確認できない開示を捏造せず、「(テーマ)関連としての物色」のように推測と分かる形で記載する
+3. (事業内容)は【企業の正式情報】の事業内容を1文で簡潔にまとめる。正式情報が与えられていない場合のみ、確実に知っている範囲で記載し、確実でなければ「事業内容の詳細は要確認」とする
+4. (背景)は好業績の仕組み・独自の強み・市場環境など。情報が多ければ4〜5個記載してもよい。ただし実際の事業内容と無関係な内容は書かない
 5. (キーワード)はテーマや業界トレンド（例: AI需要、インバウンド、防衛費増額）
 6. 関連銘柄は同様の恩恵が期待できる具体的な銘柄を2〜4社記載
-7. ポストだけでは情報が不足している場合、一般的な知識を補って分析する
+7. ポストだけでは情報が不足している場合、一般的な知識を補って分析してよい。ただし企業の事業内容・業績・開示など事実に関わる部分は、与えられた正式情報・一次情報の範囲を超えて創作しない
 8. テンプレート以外のテキスト（注記・免責・補足説明など）は一切出力しない"""\
         + materials_section
 
@@ -188,6 +216,10 @@ def _parse_output(text: str, tweet: Tweet) -> Analysis:
     backgrounds = []
     related_stocks = ""
     in_related = False
+    # 「銘柄:」〜「事業内容:」の間に出た、どのパターンにも当たらなかった行。
+    # モデルが理由行を「〜が材料視された」等と締めて「によるもの」を落とすことがあり、
+    # そのまま reason="" になると投稿が「✅ によるもの」と壊れるための保険。
+    reason_fallback = ""
 
     for line in lines:
         line = line.strip()
@@ -218,6 +250,12 @@ def _parse_output(text: str, tweet: Tweet) -> Analysis:
 
         elif in_related and line:
             related_stocks += line + "\n"
+
+        elif not business and not reason_fallback:
+            reason_fallback = line
+
+    if not reason and reason_fallback:
+        reason = reason_fallback.removesuffix("によるもの").strip()
 
     return Analysis(
         tweet=tweet,
@@ -250,9 +288,10 @@ def analyze_tweet(tweet: Tweet) -> Analysis:
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-    # 当日の一次情報（TDnet開示・株探ニュース見出し）を取得して根拠付け。
-    # 取得失敗しても従来どおり材料なしで分析を続行する。
+    # 当日の一次情報（TDnet開示・株探ニュース見出し）と企業の正式情報を取得して
+    # 根拠付け。取得失敗しても従来どおりグラウンディングなしで分析を続行する。
     materials = None
+    profile = None
     if tweet.stock_codes:
         try:
             from materials import fetch_materials
@@ -264,10 +303,22 @@ def analyze_tweet(tweet: Tweet) -> Analysis:
         except Exception as e:
             print(f"  [WARN] 材料取得失敗（材料なしで分析続行）: {e}")
             materials = None
+        try:
+            from materials import fetch_company_profile
+            profile = fetch_company_profile(tweet.stock_codes[0])
+            if profile:
+                print(f"  [企業情報] {profile.get('name', '')}: "
+                      f"{profile.get('summary', '')[:40]}")
+            else:
+                print("  [WARN] 企業プロフィールなし（正式情報なしで分析続行）")
+        except Exception as e:
+            print(f"  [WARN] 企業プロフィール取得失敗（正式情報なしで分析続行）: {e}")
+            profile = None
 
     print(f"  [Claude] 分析中: {tweet.text[:50]}...")
 
-    response = _stream_analysis_with_retry(client, _build_analysis_prompt(tweet, materials))
+    response = _stream_analysis_with_retry(
+        client, _build_analysis_prompt(tweet, materials, profile))
 
     # テキストブロックを抽出
     output_text = ""

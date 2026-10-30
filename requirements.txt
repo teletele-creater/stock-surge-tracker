@@ -8,3 +8,4 @@ matplotlib>=3.8.0
 mplfinance>=0.12.10b0
 yfinance>=0.2.31
 jpholiday>=0.1.10
+openpyxl>=3.1.0

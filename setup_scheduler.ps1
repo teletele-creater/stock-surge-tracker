@@ -1,6 +1,6 @@
 $taskDir = "C:\Users\moris\Documents\test\stock_memo"
 
-$startAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c title stock_watch & cd /d $taskDir & py -u main.py --watch 5 --slack" -WorkingDirectory $taskDir
+$startAction = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c title stock_watch & cd /d $taskDir & py -u main.py --watch 5 --auto-post" -WorkingDirectory $taskDir
 
 $startTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday -At 9:00AM
 

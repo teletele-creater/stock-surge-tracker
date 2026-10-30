@@ -14,6 +14,10 @@ from config import SLACK_BOT_TOKEN, SLACK_CHANNEL
 from storage import discard_pending_post, get_pending_posts, mark_posted
 
 
+# urllib は既定でタイムアウトが無い。2026-09-01 に画像アップロードの POST が
+# 12分以上返らず日次通知が固まったので、全ての Slack 通信に上限を入れる。
+HTTP_TIMEOUT = 60
+
 APPROVE_TOKENS = {"y", "yes", "はい", "ok", "承認"}
 REJECT_TOKENS = {"n", "no", "いいえ", "スキップ", "skip", "reject", "却下"}
 
@@ -46,7 +50,7 @@ def _slack_api_post(method: str, payload: dict) -> dict:
             "Content-Type": "application/json; charset=utf-8",
         },
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -58,13 +62,17 @@ def _slack_api_get(method: str, params: dict) -> dict:
         url,
         headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _get_channel_id() -> str:
-    """Resolve the Slack channel ID from the configured channel name."""
-    channel_name = SLACK_CHANNEL.lstrip("#")
+def _get_channel_id(channel: str | None = None) -> str:
+    """Resolve the Slack channel ID from a channel name.
+
+    channel を省略すると設定の SLACK_CHANNEL を使う（従来の挙動）。
+    急落通知など別チャンネルに送りたい呼び出し側が名前を渡せるようにしてある。
+    """
+    channel_name = (channel or SLACK_CHANNEL).lstrip("#")
     result = _slack_api_get(
         "conversations.list",
         {"types": "public_channel,private_channel", "limit": 200},
@@ -80,11 +88,15 @@ def _get_channel_id() -> str:
 
 
 def _slack_files_upload_v2(*, channel_id: str, image_bytes: bytes,
-                           filename: str, initial_comment: str) -> str:
+                           filename: str, initial_comment: str,
+                           thread_ts: str | None = None) -> str:
     """Upload an image file with caption to a Slack channel via files.upload_v2.
 
     Returns an approximate ts (taken before completing the upload) usable for
     wait_for_reply's history polling.
+
+    thread_ts を渡すとスレッド返信として投稿する。その場合は返信の ts を
+    待つ必要がないので、下の ts 解決(履歴ポーリング)はまるごと省く。
     """
     # Step 1: getUploadURLExternal
     url_res = _slack_api_get(
@@ -112,7 +124,7 @@ def _slack_files_upload_v2(*, channel_id: str, image_bytes: bytes,
         data=upload_body,
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
-    with urllib.request.urlopen(upload_req) as resp:
+    with urllib.request.urlopen(upload_req, timeout=HTTP_TIMEOUT) as resp:
         if resp.status >= 300:
             raise RuntimeError(f"Slack upload POST failed with status {resp.status}")
 
@@ -120,16 +132,19 @@ def _slack_files_upload_v2(*, channel_id: str, image_bytes: bytes,
     ts_floor = f"{time.time():.6f}"
 
     # Step 3: completeUploadExternal (channel_id + initial_comment で投稿される)
-    complete_res = _slack_api_post(
-        "files.completeUploadExternal",
-        {
-            "files": [{"id": file_id}],
-            "channel_id": channel_id,
-            "initial_comment": initial_comment,
-        },
-    )
+    complete_payload = {
+        "files": [{"id": file_id}],
+        "channel_id": channel_id,
+        "initial_comment": initial_comment,
+    }
+    if thread_ts:
+        complete_payload["thread_ts"] = thread_ts
+    complete_res = _slack_api_post("files.completeUploadExternal", complete_payload)
     if not complete_res.get("ok"):
         raise RuntimeError(f"Slack completeUploadExternal error: {complete_res.get('error')}")
+
+    if thread_ts:
+        return thread_ts
 
     # Step 4: 本物のメッセージ ts を取得 (スレッド返信を拾うため)
     # まず completeUpload のレスポンスに含まれる shares を見る
