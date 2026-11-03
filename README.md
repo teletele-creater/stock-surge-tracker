@@ -115,3 +115,10 @@ python main.py --demo           # X に接続せずに動作確認
 | `drop_detector.py` / `drop_analyzer.py` / `drop_notifier.py` / `notion_drop_storage.py` / `drop_chart.py` | 急落の検知・分析・通知・保存・チャート |
 | `dip_rebound_analysis.py` / `dip_filter.py` / `dip_routes.py` / `dip_screener.py` / `dip_chart.py` / `notify_analysis_slack.py` | 押し目の分析・スクリーニング・Slack 通知 |
 | `redo_stock.py` / `backfill_surge_prices.py` / `backfill_notion_to_supabase.py` | 特定銘柄の再分析や、過去データの補完 |
+
+
+## 権利について
+
+© 2026 teletele-creater. All rights reserved.
+
+このリポジトリは、作品として読んでもらうために公開しています。オープンソースのライセンスは付けていないため、コードの全部または一部を、許可なく複製・改変・再配布したり、自分のサービスに使ったりすることはできません。利用したい場合はご連絡ください。
