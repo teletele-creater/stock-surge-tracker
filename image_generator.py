@@ -397,7 +397,7 @@ def generate_card(analysis) -> bytes:
     if stock_code and stock_code != "不明":
         from config import SITE_BASE_URL
         site_host = re.sub(r"^https?://", "", SITE_BASE_URL)
-        fig.text(0.965, 0.017, f"詳細・過去の急騰履歴 ▶ {site_host}/#stock/{stock_code}",
+        fig.text(0.965, 0.017, f"詳細・過去の急騰履歴 ▶ {site_host}/stock/{stock_code}",
                  fontsize=11, color="#888888", ha="right", va="center")
 
     buf = io.BytesIO()

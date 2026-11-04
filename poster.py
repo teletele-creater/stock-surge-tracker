@@ -134,8 +134,8 @@ def site_stock_url(stock_code: str, when: datetime | None = None) -> str | None:
     """サイトの銘柄詳細ページへの直リンクURLを返す（コード不明なら None）。
 
     パス形式 /stock/{code}/{YYYYMMDD} を使う。Cloudflare Pages の _worker.js が
-    このパスで OGP メタタグ（og:image=チャート画像）を返すので、X がリンクカードを
-    描画し、ブラウザは /#stock/{code}（SPA の銘柄詳細）へリダイレクトされる。
+    このパスで、X のクローラーには OGP メタタグ（og:image=チャート画像）を返すので
+    X がリンクカードを描画し、人と検索エンジンにはそのまま銘柄詳細ページを返す。
 
     日付を付けるのは X のカードキャッシュ対策。X はURL単位でカードを数日キャッシュ
     するため、同じ銘柄が再急騰したときに古い（または画像取得に失敗した）カードが
