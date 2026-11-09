@@ -4,6 +4,7 @@ Claude API アナライザー
 """
 
 import anthropic
+import re
 import time
 from dataclasses import dataclass
 from datetime import timezone, timedelta
@@ -185,10 +186,33 @@ def _build_analysis_prompt(tweet: Tweet, materials: dict | None = None,
 3. (事業内容)は【企業の正式情報】の事業内容を1文で簡潔にまとめる。正式情報が与えられていない場合のみ、確実に知っている範囲で記載し、確実でなければ「事業内容の詳細は要確認」とする
 4. (背景)は好業績の仕組み・独自の強み・市場環境など。情報が多ければ4〜5個記載してもよい。ただし実際の事業内容と無関係な内容は書かない
 5. (キーワード)はテーマや業界トレンド（例: AI需要、インバウンド、防衛費増額）
-6. 関連銘柄は同様の恩恵が期待できる具体的な銘柄を2〜4社記載
+6. 関連銘柄は同様の恩恵が期待できる具体的な銘柄を2〜4社記載。最終的に挙げる銘柄だけを1社1行で書き、同じ銘柄を重複させない。検討して外した銘柄や「（除外）」「差し替え」などの注記は書かない
 7. ポストだけでは情報が不足している場合、一般的な知識を補って分析してよい。ただし企業の事業内容・業績・開示など事実に関わる部分は、与えられた正式情報・一次情報の範囲を超えて創作しない
 8. テンプレート以外のテキスト（注記・免責・補足説明など）は一切出力しない"""\
         + materials_section
+
+
+# モデルが関連銘柄を書きながら考え直し、「（除外）」「正しくは下記へ差し替え」などの途中経過や
+# 同じ銘柄の重複を残すことがある。サイトにそのまま載ると読みにくく、検索での評価も下がるので落とす
+_RELATED_JUNK = re.compile(r"除外|削除|差し替え|誤記載|比較対象外|該当なし")
+_RELATED_CODE = re.compile(r"^[(（]?\s*([0-9]{3,4}[A-Za-z]?)\s*[:：]")
+
+
+def _clean_related_stocks(text: str) -> str:
+    """関連銘柄から書き直しの跡が残った行と、同じ銘柄の2回目以降を除く。"""
+    seen = set()
+    kept = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line or _RELATED_JUNK.search(line):
+            continue
+        m = _RELATED_CODE.match(line)
+        if m:
+            if m.group(1) in seen:
+                continue
+            seen.add(m.group(1))
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def _strip_code_parens(text: str) -> str:
@@ -265,7 +289,7 @@ def _parse_output(text: str, tweet: Tweet) -> Analysis:
         business=business,
         keywords=keywords,
         backgrounds=backgrounds,
-        related_stocks=related_stocks.strip(),
+        related_stocks=_clean_related_stocks(related_stocks),
         raw_output=text
     )
 
